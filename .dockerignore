@@ -1,0 +1,25 @@
+# Dependencies and build output (rebuilt inside the image)
+**/node_modules
+**/.venv
+**/__pycache__
+frontend-v2/dist
+backend-v2/static
+
+# Secrets: never in the image (runtime values come from Container App secrets)
+**/.env
+**/.env.*
+**/wallet*/
+**/*.sso
+**/*.p12
+**/cwallet*
+**/ewallet*
+**/tnsnames.ora
+**/sqlnet.ora
+
+# Local data and non-app files
+**/*.db
+**/*.xlsx
+ControlRoom/
+backend-v2/tests
+.git
+.github

@@ -1,0 +1,113 @@
+name: Deploy Allocator
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# One deploy at a time; a new merge waits instead of cancelling a deploy halfway.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  ACR: ${{ vars.ACR_NAME }}
+  APP: ${{ vars.CONTAINER_APP_NAME }}
+  RG: ${{ vars.RESOURCE_GROUP }}
+  IMAGE: ${{ vars.ACR_NAME }}.azurecr.io/allocator:${{ github.sha }}
+
+jobs:
+  # Same checks as pull requests, run again on the merged code.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    environment: production     # app secrets live here; only main can use them
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Azure (OIDC, no passwords)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to container registry
+        run: az acr login -n $ACR
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check the Container App exists
+        id: check
+        run: |
+          if az containerapp show -n $APP -g $RG -o none 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "::warning::Image pushed ($IMAGE), but Container App '$APP' doesn't exist yet. The architect creates it once (ARCHITECT.md, Part 3), then re-run."
+          fi
+
+      # GitHub Secrets -> Container App secrets. The app reads them as env vars at runtime.
+      - name: Sync app secrets
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          az containerapp secret set -n $APP -g $RG -o none --secrets \
+            oracle-user="${{ secrets.ORACLE_USER }}" \
+            oracle-password="${{ secrets.ORACLE_PASSWORD }}" \
+            oracle-dsn="${{ secrets.ORACLE_DSN }}" \
+            jwt-secret="${{ secrets.ALLOCATOR_JWT_SECRET }}"
+
+      - name: Deploy new image
+        if: steps.check.outputs.exists == 'true'
+        timeout-minutes: 8
+        run: |
+          az containerapp update -n $APP -g $RG -o none \
+            --image $IMAGE \
+            --set-env-vars \
+              DB_BACKEND=oracle \
+              ORACLE_USER=secretref:oracle-user \
+              ORACLE_PASSWORD=secretref:oracle-password \
+              ORACLE_DSN=secretref:oracle-dsn \
+              ALLOCATOR_JWT_SECRET=secretref:jwt-secret \
+              APP_VERSION=${{ github.sha }}
+
+      - name: Smoke test /api/health
+        if: steps.check.outputs.exists == 'true'
+        timeout-minutes: 3
+        run: |
+          URL=$(az containerapp show -n $APP -g $RG --query properties.configuration.ingress.fqdn -o tsv)
+          for i in $(seq 1 12); do
+            # -f fails on non-2xx; grep guards against the SPA's index.html answering instead
+            if curl -fsS "https://$URL/api/health" | grep -q '"ok"'; then
+              echo "Live at https://$URL"; exit 0
+            fi
+            echo "Not healthy yet ($i/12), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::App did not report healthy at https://$URL/api/health"
+          exit 1
+
+      - name: Diagnostics
+        if: failure() && steps.check.outputs.exists == 'true'
+        run: |
+          az containerapp revision list -n $APP -g $RG \
+            --query "[].{revision:name, active:properties.active, health:properties.healthState, state:properties.runningState}" -o table
+          az containerapp logs show -n $APP -g $RG --type system --tail 30 || true
+          az containerapp logs show -n $APP -g $RG --type console --tail 50 || true
