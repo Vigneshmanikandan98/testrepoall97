@@ -25,11 +25,29 @@ All commands run in **Azure Cloud Shell (Bash)**. Run them one at a time.
 
 | Decision | Options | Why it matters now |
 |---|---|---|
-| **Network path to Oracle** | (a) Public Oracle endpoint with an allowlist, (b) Container Apps environment in a VNet, with a NAT gateway for a fixed outbound IP or private connectivity | The app queries Oracle on startup. If Azure can't reach it, every deploy fails. **VNet integration must be chosen when the environment is created; it can't be added later.** |
+| **Network path to Oracle** | **Known: private.** The Oracle host resolves to `10.120.x.x`, so the environment must be VNet-integrated (see below) | The app queries Oracle on startup. **VNet integration must be set when the environment is created; it can't be added later.** |
 | **Who can open the app** | (a) Public URL plus Microsoft Entra sign-in, (b) internal-only ingress on the corporate network | Affects ingress settings and Part 4 |
 | **Where app secrets live** | (a) GitHub `production` environment secrets, copied to the Container App on each deploy (current setup), (b) Azure Key Vault (see appendix) | Key Vault keeps DB credentials out of GitHub entirely |
 | **Oracle wallet** | Ask Vignesh whether the connection needs wallet files | If yes, they must be mounted into the container (extra step; tell Vignesh) |
 | **Names and region** | Fill in the table below | Used in every command |
+
+### Network: the database is private
+
+The Oracle host resolves to a private address (`10.120.x.x`). Azure can only reach it through a
+network connected to the corporate network. Before creating anything, confirm with the network team:
+
+| Question | Why |
+|---|---|
+| Which existing Azure VNet already routes to `10.120.x.x` (hub-and-spoke, ExpressRoute, or VPN)? The Kafka team's Azure workloads may already use it | The environment goes in this network |
+| A **dedicated subnet** for the Container Apps environment: minimum `/27`, delegated to `Microsoft.App/environments`, used by nothing else | Container Apps requires its own subnet |
+| Firewall or NSG rules allowing that subnet to reach the Oracle IP on its port (1521 or 1522) | Otherwise connections time out |
+| DNS: the Oracle hostname resolves to `10.120.x.x` from inside that VNet | The app connects by hostname |
+| If outbound traffic is forced through a central firewall: allow the subnet to reach the container registry (`<ACR>.azurecr.io`) and `mcr.microsoft.com` | Otherwise the app can't pull its image |
+| DBA: does Oracle have its own access list? If so, add the subnet's address range | Database-side allowlist |
+
+Record the subnet's resource ID; Part 2.3 uses it.
+
+### Names and region
 
 | Setting | Value |
 |---|---|
@@ -39,6 +57,8 @@ All commands run in **Azure Cloud Shell (Bash)**. Run them one at a time.
 | Container registry (ACR, globally unique, lowercase) | e.g. flallocatoracr |
 | Container Apps environment (ENV) | e.g. allocator-env |
 | Container App (APP) | allocator |
+| Subnet resource ID (SUBNET_ID) | from the network team |
+| Oracle host and port | from Vignesh or the DBA |
 
 Check company standards first: an existing shared registry, Key Vault, VNet, or naming
 convention may already be required.
@@ -54,6 +74,9 @@ LOC=eastus
 ACR=<registry name>
 ENV=allocator-env
 APP=allocator
+SUBNET_ID=<subnet resource ID>
+ORA_HOST=<oracle host>
+ORA_PORT=<1521 or 1522>
 SUB=$(az account show --query id -o tsv)
 TENANT=$(az account show --query tenantId -o tsv)
 ```
@@ -70,14 +93,43 @@ az provider register -n Microsoft.OperationalInsights --wait
 ```bash
 az group create -n $RG -l $LOC
 az acr create -n $ACR -g $RG --sku Basic
-az containerapp env create -n $ENV -g $RG -l $LOC
+
+az containerapp env create -n $ENV -g $RG -l $LOC \
+  --enable-workload-profiles \
+  --infrastructure-subnet-resource-id $SUBNET_ID
 ```
-For VNet integration (decision in Part 1), create the environment with your infrastructure
-subnet instead of the last command.
+- The environment is created **inside the company-connected subnet**, so the app can reach Oracle.
+  This can't be changed later; a mistake here means recreating the environment.
+- Add `--internal-only true` if the app should only be reachable from the corporate network
+  (decision "Who can open the app"). Users then need private DNS for the app's address.
+- The registry's admin user stays **disabled**. Nothing in this setup uses passwords.
 
-The registry's admin user stays **disabled**. Nothing in this setup uses passwords.
+### 2.4 Confirm the environment can reach Oracle (before any deploy)
+A throwaway container that tries the Oracle port every 30 seconds and prints the result:
+```bash
+az containerapp create -n nettest -g $RG --environment $ENV \
+  --image mcr.microsoft.com/azure-cli:latest \
+  --min-replicas 1 --max-replicas 1 \
+  --command "/bin/bash" \
+  --args "-c" "while true; do getent hosts $ORA_HOST; timeout 5 bash -c '</dev/tcp/$ORA_HOST/$ORA_PORT' && echo OPEN || echo BLOCKED; sleep 30; done"
+```
+Wait about a minute, then:
+```bash
+az containerapp logs show -n nettest -g $RG --type console --tail 10
+```
+| Output | Meaning |
+|---|---|
+| A `10.120.x.x` line, then `OPEN` | Network is ready. Continue |
+| `10.120.x.x`, then `BLOCKED` | Routing or firewall is blocking the port. Back to the network team |
+| No address line, then `BLOCKED` | DNS doesn't resolve the Oracle host inside the VNet |
+| Container never starts | Image pull blocked; check the outbound firewall rules |
 
-### 2.4 Create GitHub's login to Azure (OIDC, no stored secret)
+Delete the test container when done:
+```bash
+az containerapp delete -n nettest -g $RG --yes
+```
+
+### 2.5 Create GitHub's login to Azure (OIDC, no stored secret)
 Vignesh sends you the subject string. It looks like:
 `repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:environment:production`
 ```bash
@@ -102,7 +154,7 @@ Notes:
 - If `az ad app create` reports "Timeout waiting for token", run `az login --scope "https://graph.microsoft.com//.default"` and retry.
 - Contributor is scoped to **this resource group only**. The pipeline can deploy here and nowhere else.
 
-### 2.5 Give Vignesh read access (lets him troubleshoot without you)
+### 2.6 Give Vignesh read access (lets him troubleshoot without you)
 ```bash
 az role assignment create --assignee <vignesh@company.com> --role Reader \
   --scope /subscriptions/$SUB/resourceGroups/$RG
@@ -110,7 +162,7 @@ az role assignment create --assignee <vignesh@company.com> --role "Log Analytics
   --scope /subscriptions/$SUB/resourceGroups/$RG
 ```
 
-### 2.6 Send Vignesh these values
+### 2.7 Send Vignesh these values
 ```bash
 echo "AZURE_CLIENT_ID=$APP_ID"
 echo "AZURE_TENANT_ID=$TENANT"
@@ -149,7 +201,7 @@ az containerapp create -n $APP -g $RG --environment $ENV \
   --env-vars DB_BACKEND=oracle ORACLE_USER=secretref:oracle-user ORACLE_PASSWORD=secretref:oracle-password \
              ORACLE_DSN=secretref:oracle-dsn ALLOCATOR_JWT_SECRET=secretref:jwt-secret
 ```
-- For internal-only access (Part 1), use `--ingress internal`.
+- `--ingress external` with an internal-only environment still means corporate-network-only. For a public URL with Entra sign-in, the environment must not be internal-only.
 - `--registry-identity system` gives the app its own identity and permission to pull from the registry. This is why you run it: it grants a role, which the pipeline can't.
 - Expect 2-5 minutes.
 
@@ -164,7 +216,7 @@ If it doesn't become healthy:
 ```bash
 az containerapp logs show -n $APP -g $RG --type console --tail 50
 ```
-Oracle connection errors in the log almost always mean the network path (Part 1) isn't open.
+Oracle connection errors in the log mean the network path isn't open. Rerun the 2.4 test.
 
 ### 3.3 Send Vignesh the URL
 He verifies the app and turns on branch protection. From now on, every merge to `main` deploys
@@ -210,6 +262,7 @@ Lower it to 0 if cost matters more than first-load speed.
 | Scaling, port, ingress, sign-in, or networking changes | Update the Container App settings |
 | Oracle password rotated | If secrets are in GitHub, Vignesh updates them and reruns the deploy. If in Key Vault, update Key Vault |
 | Urgent rollback | Portal -> the Container App -> **Revisions** -> activate the previous revision and send it 100% of traffic. (Vignesh can also roll back by reverting the PR; it takes a few minutes longer) |
+| Oracle moves or changes IP or port | Update firewall rules and rerun the 2.4 test |
 | Pipeline fails with a permission error | Check the `allocator-github` role assignment on the resource group |
 
 ### Routine deploys
